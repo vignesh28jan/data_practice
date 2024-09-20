@@ -1,0 +1,277 @@
+# Code to Automate Access to Databricks for groups across workspace and Accounts
+
+import time
+import requests
+import json
+import pandas as pd
+from pyspark.sql import SparkSession
+
+# Configuration
+databricks_instance = ''
+sql_endpoint_id = ''
+account_id = ''
+workspace_id = ''
+client_id = ''
+client_secret = ''
+
+# Global variables for token management
+oauth_token = None
+token_obtained_time = None
+token_expiry_duration = 3500  # Set to 3500 seconds for early renewal
+
+# Function to obtain OAuth token
+def get_oauth_token():
+    token_url = f'https://accounts.azuredatabricks.net/oidc/accounts/{account_id}/v1/token'
+    payload = {
+        'grant_type': 'client_credentials',
+        'client_id': client_id,
+        'client_secret': client_secret,
+        'scope': 'all-apis'
+    }
+    response = requests.post(token_url, data=payload)
+    if response.status_code == 200:
+        token_info = response.json()
+        return token_info['access_token']
+    print(f'Failed to obtain OAuth token: {response.text}')
+    return None
+
+# Function to get a valid OAuth token
+def get_valid_token():
+    global oauth_token, token_obtained_time
+    current_time = time.time()
+    
+    # Check if we need to refresh the token (3500 seconds after token_obtained_time)
+    if oauth_token is None or (current_time - token_obtained_time) >= token_expiry_duration:
+        print('Token expired or not available, obtaining a new token...')
+        oauth_token = get_oauth_token()
+        token_obtained_time = current_time
+        if oauth_token:
+            print('New token obtained successfully.')
+        else:
+            raise Exception('Failed to obtain a new OAuth token.')
+
+# Function to get headers with valid OAuth token
+def get_headers():
+    get_valid_token()  # Ensure we have a valid token before returning headers
+    return {
+        'Authorization': f'Bearer {oauth_token}',
+        'Content-Type': 'application/json'
+    }
+
+# Function to list all account-level groups
+def list_account_groups(account_id):
+    url = f'https://accounts.azuredatabricks.net/api/2.0/accounts/{account_id}/groups'
+    headers = get_headers()  # Ensure valid headers
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        return response.json().get('groups', [])
+    print(f'Failed to list account groups: {response.text}')
+    return []
+
+# Function to retrieve account-level group ID
+def get_account_group_id(group_name):
+    url = f'https://accounts.azuredatabricks.net/api/2.0/accounts/{account_id}/scim/v2/Groups'
+    headers = get_headers()  # Ensure valid headers
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        groups = response.json().get('Resources', [])
+        for group in groups:
+            if group.get('displayName') == group_name:
+                return group.get('id')
+    print(f'Failed to retrieve account group ID: {response.text}')
+    return None
+
+# Function to update workspace permissions for a group
+def update_workspace_permissions(group_id):
+    url = f'https://accounts.azuredatabricks.net/api/2.0/accounts/{account_id}/workspaces/{workspace_id}/permissionassignments/principals/{group_id}'
+    payload = {
+        "permissions": [
+            "USER"
+            ]
+        }
+    headers = get_headers()  # Ensure valid headers
+    response = requests.put(url, headers=headers, data=json.dumps(payload))
+    if response.status_code == 200:
+        print(f'Successfully granted USER permission to group {group_id} in workspace {workspace_id}')
+    else:
+        print(f'Failed to update workspace permissions: {response.text}')
+
+# Function to get repo ID
+def get_repo_id(repo_name):
+    url = f'{databricks_instance}/api/2.0/repos'
+    headers = get_headers()  # Ensure valid headers
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        repos = response.json().get('repos', [])
+        for repo in repos:
+            if repo.get('path').endswith(repo_name):
+                return repo.get('id')
+    print(f'Failed to retrieve repo ID: {response.text}')
+    return None
+
+# Function to grant repository access
+def grant_repo_access(repo_name, group_name, repo_privilege):
+    repo_id = get_repo_id(repo_name)
+    if repo_id is None:
+        return
+
+    url = f'{databricks_instance}/api/2.0/permissions/repos/{repo_id}'
+    payload = {
+        "access_control_list": [
+            {
+                "group_name": group_name,
+                "permission_level": repo_privilege
+            }
+        ]
+    }
+    headers = get_headers()  # Ensure valid headers
+    response = requests.put(url, headers=headers, data=json.dumps(payload))
+    if response.status_code == 200:
+        print(f'Successfully granted {repo_privilege} to {group_name} for repo {repo_id}')
+    else:
+        print(f'Failed to grant repo access: {response.text}')
+
+# Function to retrieve cluster ID
+def get_cluster_id(cluster_name):
+    url = f'{databricks_instance}/api/2.0/clusters/list'
+    headers = get_headers()  # Ensure valid headers
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        clusters = response.json().get('clusters', [])
+        for cluster in clusters:
+            if cluster.get('cluster_name') == cluster_name:
+                return cluster.get('cluster_id')
+    print(f'Failed to retrieve cluster ID: {response.text}')
+    return None
+
+# Function to update cluster permissions
+def update_cluster_permissions(cluster_name, group_name, cluster_privilege):
+    cluster_id = get_cluster_id(cluster_name)
+    if cluster_id is None:
+        return
+
+    url = f'{databricks_instance}/api/2.0/permissions/clusters/{cluster_id}'
+    payload = {
+        "access_control_list": [
+            {
+                "group_name": group_name,
+                "permission_level": cluster_privilege
+            }
+        ]
+    }
+    headers = get_headers()  # Ensure valid headers
+    response = requests.patch(url, headers=headers, data=json.dumps(payload))
+    if response.status_code == 200:
+        print(f'Successfully updated {cluster_privilege} for {group_name} on cluster {cluster_id}')
+    else:
+        print(f'Failed to update cluster access: {response.text}')
+
+
+def run_sql_command(sql_command):
+    url = f'{databricks_instance}/api/2.0/sql/statements'
+    payload = {
+        "statement": sql_command,
+        "warehouse_id": sql_endpoint_id
+    }
+    headers = get_headers()  # Ensure valid headers
+    response = requests.post(url, headers=headers, data=json.dumps(payload))
+    if response.status_code == 200:
+        print(f'Successfully ran SQL command: {sql_command}')
+        time.sleep(2)  # Adding a short delay to ensure the command is propagated
+    else:
+        print(f'Failed to run SQL command: {response.text}')
+
+
+# Function to grant catalog and schema access
+def grant_catalog_schema_access(group_name, catalog_name, schema_name, catalog_privilege, schema_privilege):
+    # Grant catalog privilege
+    run_sql_command(f"GRANT {catalog_privilege} ON CATALOG {catalog_name} TO `{group_name}`")
+    
+    # Grant schema privileges if there are multiple schemas
+    schemas = schema_name.split(',')
+    for schema in schemas:
+        run_sql_command(f"GRANT {schema_privilege} ON SCHEMA {catalog_name}.{schema.strip()} TO `{group_name}`")
+
+# Function to grant table/view access
+def grant_table_view_access(group_name, catalog_name, schema_name, table_view_name, table_view_privilege, type):
+    if type.lower() == 'view':
+        run_sql_command(f"GRANT {table_view_privilege} ON VIEW {catalog_name}.{schema_name}.{table_view_name} TO `{group_name}`")
+    else:
+        run_sql_command(f"GRANT {table_view_privilege} ON TABLE {catalog_name}.{schema_name}.{table_view_name} TO `{group_name}`")
+
+# Function to grant default access based on the priviledges_default table
+def grant_default_access(group_name):
+    default_df = spark.sql("SELECT DISTINCT catalog, schemas FROM priviledges_default GROUP BY catalog").toPandas()
+    for index, row in default_df.iterrows():
+        catalog = row['catalog']
+        schema = row['unique_schemas']
+        grant_catalog_schema_access(group_name, catalog, schema, 'USE CATALOG', 'USE SCHEMA')
+    default_df = spark.sql("SELECT catalog, schema, table_or_view, type FROM priviledges_default").toPandas()
+    for index, row in default_df.iterrows():
+        catalog = row['catalog']
+        schema = row['schema']
+        table_or_view = row['table_or_view']
+        type = row['type']
+        grant_catalog_schema_access(group_name, catalog, schema, 'USE CATALOG', 'USE SCHEMA')
+        grant_table_view_access(group_name, catalog, schema, table_or_view, 'SELECT', type)
+    
+# Function to process catalog and schema privileges
+def process_catalog_schema_privileges():
+    df = spark.sql("SELECT p.group_name, p.catalog_name, p.schema_name, p.catalog_privilege, p.schema_privilege from master_ctlg_sch_pvlg p).toPandas()
+    for index, row in df.iterrows():
+        group_name = row['group_name']
+        catalog_name = row['catalog_name']
+        schema_name = row['schema_name']
+        catalog_privilege = row['catalog_privilege']
+        schema_privilege = row['schema_privilege']
+        grant_catalog_schema_access(group_name, catalog_name, schema_name, catalog_privilege, schema_privilege)
+
+# Function to process workspace, repo, and cluster privileges
+def process_workspace_repo_cluster_privileges():
+    df = spark.sql("SELECT group_name, workspace_name, repo_name, group_entitlement, repo_privilege, cluster_name, cluster_permission FROM master_accnt_wrksp_prvlg").toPandas()
+    for index, row in df.iterrows():
+        group_name = row['group_name']
+        workspace_name = row['workspace_name']
+        repo_name = row['repo_name']
+        group_entitlement = row['group_entitlement']
+        repo_privilege = row['repo_privilege']
+        cluster_name = row['cluster_name']
+        cluster_permission = row['cluster_permission']
+        
+        # Retrieve account-level group ID
+        group_id = get_account_group_id(group_name)
+        if group_id is None:
+            print(f'Account-level group {group_name} not found. Skipping...')
+            continue
+        
+        # Grant 'USER' permission to the workspace for the account-level group
+        update_workspace_permissions(group_id)
+        
+        # Grant repository access
+        grant_repo_access(repo_name, group_name, repo_privilege)
+        
+        # Update cluster permissions
+        update_cluster_permissions(cluster_name, group_name, cluster_permission)
+
+# Function to process table/view privileges
+def process_table_view_privileges():
+    df = spark.sql("SELECT p.group_name, p.catalog_name, p.schema_name, p.table_view_name, p.table_view_privilege, p.type FROM table_view_prvlg").toPandas()
+    for index, row in df.iterrows():
+        group_name = row['group_name']
+        catalog_name = row['catalog_name']
+        schema_name = row['schema_name']
+        table_view_name = row['table_view_name']
+        table_view_privilege = row['table_view_privilege']
+        type = row['type']
+        grant_table_view_access(group_name, catalog_name, schema_name, table_view_name, table_view_privilege, type)
+
+# Process the data for each type of privilege
+process_workspace_repo_cluster_privileges()
+process_catalog_schema_privileges()
+process_table_view_privileges()
+
+# Grant default access for all groups
+all_groups = spark.sql("SELECT DISTINCT p.group_name group_name FROM ( SELECT group_name, catalog_name,schema_name, catalog_privilege,schema_privilege FROM master_ctlg_sch_pvlg").toPandas()
+for index, row in all_groups.iterrows():
+    group_name = row['group_name']
+    grant_default_access(group_name)
